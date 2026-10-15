@@ -70,7 +70,7 @@ use crate::types::callable::{CallableTypeKind, ExpandedSignatures};
 use crate::types::constraints::ConstraintSet;
 use crate::types::context::InferContext;
 
-use crate::types::generics::{GenericContext, typing_self};
+use crate::types::generics::{GenericContext, Specialization, typing_self};
 use crate::types::infer::{infer_definition_types, nearest_enclosing_class, original_class_type};
 use crate::types::known_instance::DeprecatedInstance;
 use crate::types::narrow::ClassInfoConstraintFunction;
@@ -83,7 +83,7 @@ use crate::types::{
     SubclassOfType, Type, TypeContext, TypeMapping, UnionType, binding_type,
     definition_expression_type, walk_signature,
 };
-use crate::{Db, FxOrderSet, ProgramEnvironment};
+use crate::{Db, FxOrderSet, Program, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::ScopeId;
@@ -1310,6 +1310,34 @@ impl<'db> FunctionType<'db> {
             ),
             self.descriptor_kind(db),
         )
+    }
+
+    pub(super) fn try_specialize_stored(
+        self,
+        db: &'db dyn Db,
+        program: Program<'db>,
+        specialization: Specialization<'db>,
+    ) -> Option<Self> {
+        let literal = self.literal(db);
+        let signature = self
+            .signature(db)
+            .try_specialize_stored(db, program, specialization)?;
+        let implementation = if literal.has_separate_implementation(db) {
+            Some(
+                self.implementation_callables(db)
+                    .iter()
+                    .map(|callable| callable.try_specialize_stored(db, program, specialization))
+                    .collect::<Option<_>>()?,
+            )
+        } else {
+            None
+        };
+        Some(Self::new_internal(
+            db,
+            literal,
+            UpdatedFunctionSignatures::new(Some(signature), implementation),
+            self.descriptor_kind(db),
+        ))
     }
 
     pub(crate) fn apply_type_mapping_impl<'a>(
