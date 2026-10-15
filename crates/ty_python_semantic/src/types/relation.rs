@@ -37,7 +37,8 @@ use crate::{
 
 mod expansion;
 
-use expansion::{GuardedDisjointness, GuardedRelation};
+use expansion::GuardedDisjointness;
+pub(super) use expansion::GuardedRelation;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ComparisonKind {
@@ -1393,6 +1394,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         &self,
         db: &'db dyn Db,
         source: Type<'db>,
+        source_reference: Type<'db>,
         union: UnionType<'db>,
     ) -> ConstraintSet<'db, 'c> {
         let target = Type::Union(union);
@@ -1449,7 +1451,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         let result = elements
             .iter()
             .when_any(db, self.constraints, |&element| {
-                let result = self.check_type_pair(db, source, element);
+                let result = self.check_type_pair(db, source_reference, element);
                 if let Some(context_tree) = context_tree {
                     let context = context_tree.take();
                     if !context.is_empty() {
@@ -1708,6 +1710,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         db: &'db dyn Db,
         source: Type<'db>,
         target: Type<'db>,
+        references: (Type<'db>, Type<'db>),
         work: impl FnOnce(&GuardedRelation<'_, 'c, 'db>) -> ConstraintSet<'db, 'c>,
     ) -> ConstraintSet<'db, 'c> {
         self.env
@@ -1733,7 +1736,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                         previous_source,
                         previous_target,
                     ),
-                    None => self.with_local_recursion_guard(db, source, target, work),
+                    None => self.with_local_recursion_guard(db, source, target, references, work),
                 },
             )
     }
@@ -1743,6 +1746,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         db: &'db dyn Db,
         source: Type<'db>,
         target: Type<'db>,
+        references: (Type<'db>, Type<'db>),
         work: impl FnOnce(&GuardedRelation<'_, 'c, 'db>) -> ConstraintSet<'db, 'c>,
     ) -> ConstraintSet<'db, 'c> {
         let collect_context = self.is_context_collection_enabled();
@@ -1761,7 +1765,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 },
                 |expansion| {
                     let Some(key) = self.signature_comparison_key(db, source, target) else {
-                        return work(&GuardedRelation::new(self, expansion));
+                        return work(&GuardedRelation::new(self, expansion, references));
                     };
                     let cached = self.relation_visitor.signatures.borrow().get(&key).copied();
                     if let Some(result) = cached
@@ -1770,7 +1774,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                     {
                         return result;
                     }
-                    let result = work(&GuardedRelation::new(self, expansion));
+                    let result = work(&GuardedRelation::new(self, expansion, references));
                     self.relation_visitor
                         .signatures
                         .borrow_mut()
@@ -1920,6 +1924,18 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         source: Type<'db>,
         target: Type<'db>,
     ) -> ConstraintSet<'db, 'c> {
+        self.check_type_pair_with_references(db, source, target, (source, target))
+    }
+
+    /// Retain the original references while inspecting their expanded bodies. Union branches
+    /// compare against those references so their guards still recognize recursive aliases.
+    fn check_type_pair_with_references(
+        &self,
+        db: &'db dyn Db,
+        source: Type<'db>,
+        target: Type<'db>,
+        references: (Type<'db>, Type<'db>),
+    ) -> ConstraintSet<'db, 'c> {
         // Reflexivity and lazy constraints can bypass the RecursiveVar match arm below.
         source.assert_not_recursive_var();
         target.assert_not_recursive_var();
@@ -1940,7 +1956,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             return self.always();
         }
 
-        self.with_recursion_guard(db, source, target, |comparison| {
+        self.with_recursion_guard(db, source, target, references, |comparison| {
             self.check_type_pair_guarded(db, comparison, source, target)
         })
     }
@@ -2482,8 +2498,12 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 self.check_newtype_pair(db, source_newtype, target_newtype)
             }
 
-            (Type::Union(union), _) => self.check_source_union(db, union, target),
-            (_, Type::Union(union)) => self.check_target_union(db, source, union),
+            (Type::Union(union), _) => {
+                self.check_source_union(db, union, comparison.target_reference())
+            }
+            (_, Type::Union(union)) => {
+                self.check_target_union(db, source, comparison.source_reference(), union)
+            }
 
             // If both sides are intersections we need to handle the right side first
             // (A & B & C) is a subtype of (A & B) because the left is a subtype of both A and B,
